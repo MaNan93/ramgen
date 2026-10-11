@@ -11,7 +11,9 @@ from __future__ import print_function
 
 import os
 import re
+from collections import defaultdict, deque
 from xml.sax.saxutils import escape
+from .sv_scan import instance_declarations, matching_delimiters, module_headers, tokenize
 
 
 COMMON_PARAM_NAMES = ["RD_LATENCY", "WD", "PW", "DP"]
@@ -173,24 +175,56 @@ def generate_output_sv(source_sv_path, output_sv_path, report, top_module_name="
     with open(source_sv_path, "r", encoding="utf-8") as handle:
         text = handle.read()
 
-    text = re.sub(
-        r"\bmodule\s+{}\b".format(re.escape(report["module"])),
-        "module {}".format(top_module_name),
-        text,
-        count=1,
-    )
+    # Analyze and rewrite with the same balanced, comment-aware token rules.
+    tokens = tokenize(text)
+    closing = matching_delimiters(tokens)
 
+    references = defaultdict(deque)
+    ram_types = set()
     for item in report["instances"]:
-        old_ref = item["type"]
-        new_ref = item.get("reference", old_ref)
-        inst_name = item["name"]
-        pattern = re.compile(
-            r"\b{}\b(?=\s*(?:#\s*\(.*?\))?\s*{}\b)".format(
-                re.escape(old_ref), re.escape(inst_name)
-            ),
-            flags=re.DOTALL,
-        )
-        text = pattern.sub(new_ref, text, count=1)
+        references[(item["type"], item["name"])].append(item.get("reference", item["type"]))
+        ram_types.add(item["type"])
+    edits = []
+    target_header = next(((idx, name_idx) for idx, name_idx in module_headers(tokens)
+                          if tokens[name_idx].group() == report["module"]), None)
+    if target_header:
+        _, name_idx = target_header
+        name = tokens[name_idx]
+        edits.append((name.start(), name.end(), top_module_name))
+        # An end label must follow the renamed declaration, including nesting.
+        depth = 1
+        for idx in range(name_idx + 1, len(tokens)):
+            value = tokens[idx].group()
+            if value == "module":
+                depth += 1
+            elif value == "endmodule":
+                depth -= 1
+                if depth == 0:
+                    if idx + 2 < len(tokens) and tokens[idx + 1].group() == ':' and tokens[idx + 2].group() == report["module"]:
+                        label = tokens[idx + 2]
+                        edits.append((label.start(), label.end(), top_module_name))
+                    break
+    for declaration in instance_declarations(text, tokens, closing, ram_types.__contains__):
+        old_type = declaration["type"]
+        new_types = []
+        for instance in declaration["instances"]:
+            refs = references.get((old_type, instance["name"]))
+            new_types.append(refs.popleft() if refs else old_type)
+        edits.append((declaration["type_start"], declaration["type_end"], new_types[0]))
+        if len(set(new_types)) > 1:
+            # A shared declaration has one type. Split it when reports request
+            # different references, repeating its original parameter overrides.
+            suffix = text[declaration["type_end"]:declaration["instances"][0]["name_start"]]
+            for instance, new_type in zip(declaration["instances"][1:], new_types[1:]):
+                comma = instance["separator"]
+                edits.append((comma.start(), comma.end(), ";\n" + new_type + suffix))
+    parts = []
+    cursor = 0
+    for start, end, replacement in sorted(edits):
+        parts.extend((text[cursor:start], replacement))
+        cursor = end
+    parts.append(text[cursor:])
+    text = "".join(parts)
 
     output_dir = os.path.dirname(os.path.abspath(output_sv_path))
     ensure_dir(output_dir)

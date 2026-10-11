@@ -10,9 +10,11 @@ Provides analysis and reporting of RAM wrapper instances.
 from __future__ import print_function
 
 import ast
+import hashlib
 import os
 import re
 from collections import OrderedDict
+from .sv_scan import instance_declarations, mask_comments, matching_delimiters, module_headers, named_connections, tokenize
 
 
 class SafeExpressionEvaluator(ast.NodeVisitor):
@@ -83,9 +85,7 @@ def normalize_sv_text(text):
 
 def remove_comments(text):
     """Remove Verilog block and line comments."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    text = re.sub(r"//.*", "", text)
-    return text
+    return mask_comments(text)
 
 
 def convert_verilog_literals(expr):
@@ -133,9 +133,9 @@ def parse_param_block(block):
     if not block:
         return params
 
-    for match in re.finditer(r"\.\s*(\w+)\s*\(\s*(.*?)\s*\)", block, flags=re.DOTALL):
-        key = match.group(1)
-        value = " ".join(match.group(2).split())
+    block = remove_comments(block)
+    for key, expression in named_connections(block):
+        value = " ".join(expression.split())
         params[key] = value
     return params
 
@@ -146,9 +146,9 @@ def parse_port_block(block):
     if not block:
         return ports
 
-    for match in re.finditer(r"\.\s*(\w+)\s*\(\s*(.*?)\s*\)", block, flags=re.DOTALL):
-        port = match.group(1)
-        signal = " ".join(match.group(2).split())
+    block = remove_comments(block)
+    for port, expression in named_connections(block):
+        signal = " ".join(expression.split())
         ports[port] = signal
     return ports
 
@@ -186,7 +186,16 @@ def build_reference_name(reference_name, params):
     wd = str(params.get("WD", "")).strip()
 
     if "wrapper" in reference_name and dp and wd:
-        return reference_name.replace("wrapper", "{}wx{}".format(dp, wd))
+        # Expressions/literals cannot be inserted verbatim into identifiers.
+        values = [safe_eval_int(value) for value in (dp, wd)]
+        dimensions = [str(value) if value is not None else expression
+                      for value, expression in zip(values, (dp, wd))]
+        # Unresolved expressions remain intact in the source/parameter maps.
+        # Only the derived module/file identifier needs an opaque safe spelling.
+        dimensions = [value if re.fullmatch(r"[A-Za-z0-9_$]+", value) else
+                      "expr_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+                      for value in dimensions]
+        return reference_name.replace("wrapper", "{}wx{}".format(*dimensions))
     return reference_name
 
 
@@ -196,50 +205,43 @@ def analyze_sv_file(file_path):
         raw_text = handle.read()
 
     normalized = normalize_sv_text(raw_text)
-    clean_text = remove_comments(normalized)
+    # Tokenization already skips comments and keeps strings opaque. Mask only
+    # the small extracted expression blocks instead of scanning the file twice.
+    clean_text = normalized
 
-    module_match = re.search(r"\bmodule\s+(\w+)\b", clean_text)
-    module_name = module_match.group(1) if module_match else "<unknown>"
-
-    instance_pattern = re.compile(
-        r"(?P<type>\b\w+(?:_wrapper|_ram|ram\w*)\b)\s*"
-        r"(?:#\s*\((?P<params>.*?)\))?\s*"
-        r"(?P<name>\b\w+\b)\s*"
-        r"(?P<array>\[[^\]]+\])?\s*"
-        r"\((?P<ports>.*?)\)\s*;",
-        flags=re.DOTALL,
-    )
+    tokens = tokenize(clean_text)
+    closing = matching_delimiters(tokens)
+    header = next(module_headers(tokens), None)
+    module_name = tokens[header[1]].group() if header else "<unknown>"
+    ram_type = re.compile(r"[A-Za-z_$][\w$]*(?:_wrapper|_ram|ram[\w$]*)\Z")
 
     instances = []
-    for match in instance_pattern.finditer(clean_text):
-        inst_type = match.group("type")
-        inst_name = match.group("name")
-
-        if inst_type == "module" or inst_name == module_name:
-            continue
-
-        params = parse_param_block(match.group("params"))
-        ports = parse_port_block(match.group("ports"))
-        array_range = match.group("array") or ""
-        array_size = parse_array_size(array_range)
+    for declaration in instance_declarations(clean_text, tokens, closing, ram_type.fullmatch):
+        inst_type = declaration["type"]
+        params = parse_param_block(declaration["params"])
         bits_per_ram = estimate_bits(params)
-
         base_reference = build_reference_name(inst_type, params)
-        instances.append(
-            {
-                "type": inst_type,
-                "name": inst_name,
-                "reference": base_reference,
-                "base_reference": base_reference,
-                "array_range": array_range,
-                "array_size": array_size,
-                "params": params,
-                "ports": ports,
-                "unconnected_ports": [k for k, v in ports.items() if not v],
-                "bits_per_ram": bits_per_ram,
-                "total_bits": (bits_per_ram * array_size) if bits_per_ram is not None else None,
-            }
-        )
+        for instance in declaration["instances"]:
+            ports = parse_port_block(instance["ports"])
+            array_range = "".join(instance["arrays"])
+            array_size = 1
+            for dimension in instance["arrays"]:
+                array_size *= parse_array_size(dimension)
+            instances.append(
+                {
+                    "type": inst_type,
+                    "name": instance["name"],
+                    "reference": base_reference,
+                    "base_reference": base_reference,
+                    "array_range": array_range,
+                    "array_size": array_size,
+                    "params": OrderedDict(params),
+                    "ports": ports,
+                    "unconnected_ports": [k for k, v in ports.items() if not v],
+                    "bits_per_ram": bits_per_ram,
+                    "total_bits": (bits_per_ram * array_size) if bits_per_ram is not None else None,
+                }
+            )
 
     type_summary = OrderedDict()
     total_blocks = 0
