@@ -7,7 +7,7 @@ A lightweight Python package for analyzing SystemVerilog RAM instances and gener
 ```text
 ramgen/
     src/ramgen/               # package source code
-        cli.py                  # CLI entry + public ramgen() API
+        main.py                 # CLI entry + public ramgen() API
         ram_analyzer.py         # SV parsing and analysis
         ram_generator.py        # wrapper/top/report generation
         ram_simulation.py       # tb/flist/makefile generation
@@ -16,6 +16,17 @@ ramgen/
     dist/                     # wheel artifacts (build output)
     pyproject.toml
 ```
+
+## Run with uv
+
+Run from this repository. `.python-version` selects Python 3.12 and uv installs the locked dependencies:
+
+```powershell
+uv run ramgen --help
+uv run ramgen examples/pcie_iip_rams.sv --output-dir output
+```
+
+Use `uv sync --locked` to prepare the environment ahead of time.
 
 ## Install
 
