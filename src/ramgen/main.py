@@ -159,7 +159,14 @@ def build_output_layout(output_dir, sv_file, file_prefix=""):
 def build_arg_parser():
     """Build command-line argument parser."""
     parser = argparse.ArgumentParser(
-        description="Analyze a SystemVerilog RAM file and generate outputs."
+        description="Analyze a SystemVerilog RAM file and generate outputs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Run from the ramgen repository (Python 3.12 recommended):\n"
+            "  uv run ramgen --help\n"
+            "  uv run ramgen examples/pcie_iip_rams.sv --output-dir output\n"
+            "  uv run ramgen input.sv --module-prefix demo --file-prefix gen"
+        ),
     )
     parser.add_argument(
         "sv_file",
