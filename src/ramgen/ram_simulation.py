@@ -11,6 +11,7 @@ from __future__ import print_function
 
 import os
 
+from .ram_analyzer import safe_eval_int
 from .ram_generator import is_byte_enable_ram, get_param_names, get_param_defaults, ensure_dir
 
 
@@ -41,6 +42,59 @@ def infer_interface_name(item):
     return "ram_1p_if"
 
 
+def build_extra_checks(dual_port=False, dual_clock=False, byte_enable=False):
+    """Directed checks drive on falling edges and sample after the read edge."""
+    if dual_port:
+        wc, rc = ("clka", "clkb") if dual_clock else ("clk", "clk")
+        return """
+            // Both write controls must gate writes independently.
+            for (idx = 0; idx < DP; idx = idx + 1) begin
+                @(negedge WC); ena = 0; wea = 1; addra = idx; dina = ~exp_mem[idx];
+                @(posedge WC); @(negedge WC); ena = 1; wea = 0;
+                @(posedge WC); @(negedge WC); ena = 0;
+                @(negedge RC); enb = 1; addrb = idx;
+                @(posedge RC); @(negedge RC);
+                check_data(doutb, exp_mem[idx], inst_name, idx, "write gating");
+            end
+            // The generated behavioral model holds its output while disabled.
+            held_data = doutb;
+            @(negedge RC); enb = 0; addrb = 0;
+            repeat (3) @(posedge RC);
+            @(negedge RC);
+            check_data(doutb, held_data, inst_name, 0, "read gating");
+""".replace("WC", wc).replace("RC", rc)
+    text = """
+            // Disabled writes must preserve every address, including boundaries.
+            for (idx = 0; idx < DP; idx = idx + 1) begin
+                @(negedge clk); en = 0; we = '1; addr = idx; din = ~exp_mem[idx];
+                @(posedge clk); @(negedge clk); en = 1; we = '0;
+                @(posedge clk); @(negedge clk);
+                check_data(dout, exp_mem[idx], inst_name, idx, "write gating");
+            end
+"""
+    if byte_enable:
+        text += """
+            // Exercise every byte at every address, then its inverse mask.
+            // Expected values use bit/8 indexing independently of the DUT loops.
+            for (idx = 0; idx < DP; idx = idx + 1) begin
+                for (lane = 0; lane < WEW; lane = lane + 1) begin
+                    for (mask_case = 0; mask_case < 2; mask_case = mask_case + 1) begin
+                        we_mask = '0; we_mask[lane] = 1'b1;
+                        if (mask_case) we_mask = ~we_mask;
+                        wr_data = ~exp_mem[idx];
+                        @(negedge clk); en = 1; addr = idx; din = wr_data; we = we_mask;
+                        for (bit_idx = 0; bit_idx < WD; bit_idx = bit_idx + 1)
+                            if (we_mask[bit_idx / 8]) exp_mem[idx][bit_idx] = wr_data[bit_idx];
+                        @(posedge clk); @(negedge clk); we = '0;
+                        @(posedge clk); @(negedge clk);
+                        check_data(dout, exp_mem[idx], inst_name, idx, "byte mask");
+                    end
+                end
+            end
+"""
+    return text + "            @(negedge clk); en = 0; we = '0;\n"
+
+
 def build_interface_template(iface_name, signal_lines, task_lines, include_wew=False):
     """Build a verification interface from shared signal and task templates."""
     defaults = {"RD_LATENCY": 1, "WD": 8, "PW": 4, "DP": 16, "WEW": 1}
@@ -53,7 +107,26 @@ def build_interface_template(iface_name, signal_lines, task_lines, include_wew=F
     lines = ["interface {} #({}) ();".format(iface_name, param_decl)]
     lines.extend(signal_lines)
     lines.append("    localparam [WD-1:0] TEST_DATA = {WD{1'b1}};")
-    lines.append("")
+    lines.extend([
+        "    integer errors = 0;",
+        "    function automatic [WD-1:0] random_word(inout integer seed);",
+        "        integer bit_no; reg [31:0] chunk;",
+        "        for (bit_no = 0; bit_no < WD; bit_no = bit_no + 1) begin",
+        "            if (bit_no % 32 == 0) chunk = $random(seed);",
+        "            random_word[bit_no] = chunk[bit_no % 32];",
+        "        end",
+        "    endfunction",
+        "    task automatic check_data(input logic [WD-1:0] actual, expected, input string inst_name, input integer address, input string phase);",
+        "        if (actual !== expected) begin",
+        "            errors++;",
+        '        $display("FAIL %s %s addr=%0d expected=%h actual=%h", inst_name, phase, address, expected, actual);',
+        "        end",
+        "    endtask",
+        "",
+    ])
+    # Keep collecting failures, but never emit PASS after an error.
+    task_lines = [line.replace('$error(', 'begin errors++; $display(') + ' end'
+                  if '$error(' in line else line for line in task_lines]
     lines.extend(task_lines)
     lines.append("endinterface")
     return lines
@@ -81,6 +154,7 @@ def build_dual_port_interface(iface_name, dual_clock):
         "        reg [WD-1:0] exp_mem [0:DP-1];",
         "        reg [WD-1:0] wr_data;",
         "        integer idx;",
+        "        reg [WD-1:0] held_data;",
         "        integer rand_seed;",
         "        begin",
         "            addra <= #(TP) '0; addrb <= #(TP) '0; dina <= #(TP) '0; ena <= #(TP) 1'b0; enb <= #(TP) 1'b0; wea <= #(TP) 1'b0;",
@@ -112,7 +186,7 @@ def build_dual_port_interface(iface_name, dual_clock):
         "            enb <= #(TP) 1'b0;",
         "            repeat (5) @(posedge {});".format(write_clk),
         "            for (idx = 0; idx < DP; idx = idx + 1) begin",
-        "                wr_data = $random(rand_seed);",
+        "                wr_data = random_word(rand_seed);",
         "                ena <= #(TP) 1'b1; wea <= #(TP) 1'b1; addra <= #(TP) idx; dina <= #(TP) wr_data; exp_mem[idx] = wr_data;",
         "                @(posedge {});".format(write_clk),
         "            end",
@@ -122,6 +196,8 @@ def build_dual_port_interface(iface_name, dual_clock):
         "                @(posedge {}); enb <= #(TP) 1'b1; addrb <= #(TP) idx; @(posedge {}); @(negedge {});".format(read_clk, read_clk, read_clk),
         "                if (doutb !== exp_mem[idx]) $error(\"%s random test failed at depth %0d\", inst_name, idx);",
         "            end",
+        build_extra_checks(dual_port=True, dual_clock=dual_clock),
+        '            if (errors != 0) $fatal(1, "%s failed: %0d errors", inst_name, errors);',
         "            ena <= #(TP) 1'b0; enb <= #(TP) 1'b0; wea <= #(TP) 1'b0;",
         "            $display(\"%s all depth tests passed\", inst_name);",
         "        end",
@@ -153,15 +229,17 @@ def build_single_port_interface(iface_name, include_wew=False):
             "        integer lane;",
             "        integer bit_idx;",
             "        integer lane_w;",
+            "        integer mask_case;",
             "        integer rand_seed;",
         ])
     task_lines.extend([
         "        integer idx;",
+        "        reg [WD-1:0] held_data;",
         "        reg [WD-1:0] wr_data;" if not include_wew else None,
         "        integer rand_seed;" if not include_wew else None,
         "        begin",
         "            addr <= #(TP) '0; din <= #(TP) '0; en <= #(TP) 1'b0; we <= #(TP) '0;" if include_wew else "            addr <= #(TP) '0; din <= #(TP) '0; en <= #(TP) 1'b0; we <= #(TP) 1'b0;",
-            "            exp_data = 'x; lane_w = (WEW > 0) ? ((WD + WEW - 1) / WEW) : WD;" if include_wew else None,
+            "            exp_data = 'x; lane_w = 8;" if include_wew else None,
         "            if (!$value$plusargs(\"SEED=%d\", rand_seed)) rand_seed = 32'h1A2B3C4D;",
             "            for (idx = 0; idx < DP; idx = idx + 1) exp_mem[idx] = 'x;",
         "            repeat (2) @(posedge clk);",
@@ -200,7 +278,7 @@ def build_single_port_interface(iface_name, include_wew=False):
             "            end",
             "            repeat (5) @(posedge clk);",
             "            for (idx = 0; idx < DP; idx = idx + 1) begin",
-            "                wr_data = $random(rand_seed); we_mask = $random(rand_seed);",
+            "                wr_data = random_word(rand_seed); we_mask = $random(rand_seed);",
             "                if (idx == 0) begin we_mask = '0; if (WEW > 0) we_mask[0] = 1'b1; end",
             "                en <= #(TP) 1'b1; addr <= #(TP) idx; din <= #(TP) wr_data; we <= #(TP) we_mask;",
             "                for (lane = 0; lane < WEW; lane = lane + 1) begin",
@@ -245,7 +323,7 @@ def build_single_port_interface(iface_name, include_wew=False):
             "            end",
             "            repeat (5) @(posedge clk);",
             "            for (idx = 0; idx < DP; idx = idx + 1) begin",
-            "                wr_data = $random(rand_seed);",
+            "                wr_data = random_word(rand_seed);",
             "                en <= #(TP) 1'b1; we <= #(TP) 1'b1; addr <= #(TP) idx; din <= #(TP) wr_data; exp_mem[idx] = wr_data;",
             "                @(posedge clk);",
             "            end",
@@ -259,6 +337,8 @@ def build_single_port_interface(iface_name, include_wew=False):
         ])
 
     task_lines.extend([
+        build_extra_checks(byte_enable=include_wew),
+        '            if (errors != 0) $fatal(1, "%s failed: %0d errors", inst_name, errors);',
         "            $display(\"%s all depth tests passed\", inst_name);",
         "        end",
         "    endtask",
@@ -411,6 +491,15 @@ def build_combined_testbench_text(report, tb_module_name="pcie_ram_tb"):
         "    end",
     ])
 
+    max_work = max((safe_eval_int(item.get("params", {}).get("DP", "")) or 16) *
+                   (100 + 100 * (safe_eval_int(item.get("params", {}).get("WEW", "")) or 1))
+                   for item in report.get("instances", [])) if report.get("instances") else 1000
+    lines.extend([
+        "    initial begin",
+        "        #{};".format(max(100000, max_work * 10)),
+        '        $fatal(1, "RAM testbench timeout");',
+        "    end",
+    ])
     lines.extend(["", "endmodule", ""])
     return "\n".join(lines)
 
@@ -489,6 +578,7 @@ DEFINES ?= +define+INNO_REG_RAM
 all: sim
 
 sim:
+	$(RM) $(LOG)
 	$(SIM) \\
 		-sverilog \\
 		-F $(FLIST) \\
@@ -500,6 +590,7 @@ sim:
         -full64 \
         $(RUN_PLUSARGS) $(DEFINES) \
 		-top $(TOP)
+	@grep -q '^All RAM instance tests completed[.]' "$(LOG)" || {{ echo "RAM verification failed; see $(LOG)"; exit 1; }}
 
 run: sim
 

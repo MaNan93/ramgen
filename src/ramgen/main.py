@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 RAM Generator - Main Orchestration Module
@@ -217,6 +217,10 @@ def ramgen(sv_file=None, output_dir=DEFAULT_OUTPUT_DIR, module_prefix="", file_p
     normalized_module_prefix = normalize_name_prefix(module_prefix)
     normalized_file_prefix = normalize_name_prefix(file_prefix)
     report = analyze_sv_file(sv_file)
+    errors = [entry for entry in report["diagnostics"] if entry["severity"] == "error"]
+    if errors:
+        raise ValueError("RAM interface validation failed:\n" + "\n".join(
+            "{}: {}".format(entry["instance"], entry["message"]) for entry in errors))
     generated_report = apply_module_prefix(report, normalized_module_prefix)
     layout = build_output_layout(output_dir, sv_file, file_prefix=normalized_file_prefix)
 

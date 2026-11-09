@@ -298,7 +298,7 @@ def build_simulation_body(item):
     wire ren;
     integer i;
     integer j;
-    localparam integer LANE_W = (WEW > 0) ? ((WD + WEW - 1) / WEW) : WD;
+    localparam integer LANE_W = 8;
 
     assign wen = en && (|we);
     assign ren = en && ~(|we);

@@ -17,6 +17,89 @@ from collections import OrderedDict
 from .sv_scan import instance_declarations, mask_comments, matching_delimiters, module_headers, named_connections, tokenize
 
 
+# Explicit contracts for the supported PCIe wrappers. Widths are expressions in
+# the wrapper's parameters, not guesses based on the connected signal's name.
+RAM_INTERFACES = {
+    "ram_1p_wrapper": ("single_port", False, ("clk",)),
+    "ram_1p_be_wrapper": ("single_port", True, ("clk",)),
+    "ram_2p_1c_wrapper": ("simple_dual_port", False, ("clk",)),
+    "ram_2p_2c_wrapper": ("simple_dual_port", False, ("clka", "clkb")),
+}
+
+
+def analyze_interface(item):
+    """Attach a supported interface contract and actionable diagnostics.
+
+    This validates the wrapper call, not arbitrary SV expression widths or
+    collision/read-during-write behavior of the underlying memory cell.
+    """
+    diagnostics = []
+
+    def issue(severity, code, message):
+        diagnostics.append(dict(severity=severity, code=code,
+                                instance=item["name"], message=message))
+
+    contract = RAM_INTERFACES.get(item["type"])
+    if contract is None:
+        issue("warning", "unknown_ram_type", "No interface contract for {}".format(item["type"]))
+        return None, diagnostics
+
+    kind, byte_enable, clocks = contract
+    widths = OrderedDict((clock, "1") for clock in clocks)
+    if kind == "single_port":
+        widths.update(addr="PW", din="WD", dout="WD", en="1",
+                      we="WEW" if byte_enable else "1")
+    else:
+        widths.update(addra="PW", addrb="PW", dina="WD", doutb="WD",
+                      ena="1", enb="1", wea="1")
+    params = item["params"]
+    required = ("WD", "PW", "DP", "RD_LATENCY") + (("WEW",) if byte_enable else ())
+    values = {name: safe_eval_int(params.get(name)) for name in required}
+    for name in required:
+        if name not in params:
+            issue("error", "missing_parameter", "Missing parameter {}".format(name))
+        elif values[name] is None:
+            issue("warning", "unresolved_parameter", "Cannot resolve {}={}".format(name, params[name]))
+        elif values[name] <= 0:
+            issue("error", "invalid_parameter", "{} must be positive".format(name))
+    pw, dp = values["PW"], values["DP"]
+    if pw is not None and dp is not None and pw > 0 and dp > 0 and (dp - 1).bit_length() > pw:
+        issue("error", "address_capacity", "DP exceeds the address capacity of PW")
+    if byte_enable:
+        wd, wew = values["WD"], values["WEW"]
+        if wd is not None and wd > 0 and wew is not None and wew != (wd + 7) // 8:
+            issue("error", "byte_enable_width", "WEW must equal ceil(WD / 8)")
+    elif "WEW" in params:
+        issue("error", "unexpected_parameter", "WEW is only supported by ram_1p_be_wrapper")
+
+    ports = item["ports"]
+    for name in widths:
+        if name not in ports:
+            issue("error", "missing_port", "Missing port {}".format(name))
+        elif not ports[name] and not name.startswith("dout"):
+            issue("error", "unconnected_input", "Input {} is unconnected".format(name))
+    for name in ports:
+        if name not in widths:
+            issue("error", "unknown_port", "Unknown port {}".format(name))
+
+    interface = {
+        "kind": kind, "byte_enable": byte_enable, "clocks": list(clocks),
+        "write_clock": clocks[0], "read_clock": clocks[-1],
+        "read_latency": values["RD_LATENCY"],
+        "ports": OrderedDict((name, {
+            "direction": "output" if name.startswith("dout") else "input",
+            "width_expression": width,
+            "width": 1 if width == "1" else values.get(width),
+            "connection": ports.get(name),
+        }) for name, width in widths.items()),
+    }
+    if byte_enable:
+        wd = values["WD"]
+        interface["byte_lane_width"] = 8
+        interface["last_lane_width"] = ((wd - 1) % 8 + 1) if wd is not None and wd > 0 else None
+    return interface, diagnostics
+
+
 class SafeExpressionEvaluator(ast.NodeVisitor):
     """Safely evaluate simple arithmetic expressions used in SV parameters."""
 
@@ -243,6 +326,12 @@ def analyze_sv_file(file_path):
                 }
             )
 
+    diagnostics = []
+    for item in instances:
+        item["interface"], item["diagnostics"] = analyze_interface(item)
+        diagnostics.extend(item["diagnostics"])
+    errors = [entry for entry in diagnostics if entry["severity"] == "error"]
+
     type_summary = OrderedDict()
     total_blocks = 0
     total_bits = 0
@@ -267,11 +356,15 @@ def analyze_sv_file(file_path):
         "total_bits": total_bits if total_bits_known else None,
         "type_summary": type_summary,
         "instances": instances,
+        "diagnostics": diagnostics,
+        "validation_passed": not errors,
     }
 
 
 def print_human_readable(report):
     """Print a compact human-readable report of the analysis results."""
+    for entry in report.get("diagnostics", []):
+        print("{} | {} | {}".format(entry["severity"].upper(), entry["instance"], entry["message"]))
     print("RAM {} | {} | {} inst".format(
         report["module"],
         os.path.basename(report["file"]),
